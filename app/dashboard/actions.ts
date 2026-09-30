@@ -1,0 +1,163 @@
+"use server";
+
+import { auth, currentUser } from "@clerk/nextjs/server";
+import { env } from "cloudflare:workers";
+import { getFeed, getPost, type FeedTab, type Media } from "@/lib/feed";
+import { isVideo, MAX_COMMENT_CHARS, MAX_IMAGES, MAX_POST_CHARS, MEDIA_TYPES } from "@/lib/media";
+import { broadcast } from "@/lib/realtime";
+
+/** A message safe to show the user. Other errors get redacted by the framework in production. */
+class Fail extends Error {}
+const failed = (e: unknown) => {
+  if (e instanceof Fail) return { error: e.message };
+  throw e;
+};
+
+// Every action re-checks auth: server actions are public POST endpoints.
+async function viewer() {
+  const { userId } = await auth();
+  if (!userId) throw new Error("Unauthorized");
+  return userId;
+}
+
+async function writer() {
+  const userId = await viewer();
+  const { success } = await env.WRITE_LIMIT.limit({ key: userId });
+  if (!success) throw new Fail("You're doing that too fast. Try again in a minute.");
+  return userId;
+}
+
+/** Snapshot the author's Clerk profile so feeds can join on it without calling Clerk. */
+async function syncUser(userId: string) {
+  const u = await currentUser();
+  const name = u?.fullName || u?.username || "Member";
+  const headline = typeof u?.publicMetadata?.headline === "string" ? u.publicMetadata.headline : null;
+  await env.DB.prepare(
+    `INSERT INTO users (id, name, image_url, headline, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+     ON CONFLICT (id) DO UPDATE SET name = ?2, image_url = ?3, headline = ?4, updated_at = ?5`,
+  ).bind(userId, name, u?.imageUrl ?? null, headline, Date.now()).run();
+}
+
+async function pushStats(postId: string) {
+  const p = await env.DB.prepare("SELECT like_count, comment_count, repost_count FROM posts WHERE id = ?")
+    .bind(postId).first<{ like_count: number; comment_count: number; repost_count: number }>();
+  if (p) await broadcast({ t: "stats", id: postId, likes: p.like_count, comments: p.comment_count, reposts: p.repost_count });
+  return p;
+}
+
+const text = (v: unknown, max: number) => (typeof v === "string" ? v.trim() : "").slice(0, max);
+
+export async function loadFeed(tab: FeedTab, cursor?: string) {
+  return getFeed(await viewer(), tab === "following" ? "following" : "for-you", cursor);
+}
+
+export async function createPost(input: { body: string; media: string[] }) {
+  return publish(input).then((post) => ({ post: post! }), failed);
+}
+
+async function publish(input: { body: string; media: string[] }) {
+  const userId = await writer();
+  const body = text(input.body, MAX_POST_CHARS);
+  const keys = Array.isArray(input.media) ? [...new Set(input.media.map(String))] : [];
+
+  // Media must be objects this user uploaded (keys are server-issued and namespaced by user id)
+  const media: Media[] = [];
+  for (const key of keys.slice(0, MAX_IMAGES)) {
+    if (!key.startsWith(`${userId}/`)) throw new Fail("Invalid media");
+    const obj = await env.MEDIA.head(key);
+    const type = obj?.httpMetadata?.contentType ?? "";
+    if (!obj || obj.customMetadata?.owner !== userId || !MEDIA_TYPES[type]) throw new Fail("Invalid media");
+    media.push({ key, type });
+  }
+  const videos = media.filter((m) => isVideo(m.type)).length;
+  if (videos > 1 || (videos === 1 && media.length > 1)) throw new Fail("A post can have up to 4 images or 1 video");
+  if (!body && media.length === 0) throw new Fail("Write something or add media");
+
+  await syncUser(userId);
+  const id = crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO posts (id, author_id, body, media, created_at) VALUES (?, ?, ?, ?, ?)")
+    .bind(id, userId, body, media.length ? JSON.stringify(media) : null, Date.now()).run();
+  await broadcast({ t: "post", id, authorId: userId });
+  return getPost(userId, id);
+}
+
+export async function deletePost(id: string) {
+  const userId = await writer();
+  const post = await env.DB.prepare("SELECT media, repost_of FROM posts WHERE id = ? AND author_id = ?")
+    .bind(String(id), userId).first<{ media: string | null; repost_of: string | null }>();
+  if (!post) throw new Error("Not found");
+  // Reposts of this post cascade in SQL; their counters don't matter since the original is gone
+  await env.DB.prepare("DELETE FROM posts WHERE id = ?").bind(String(id)).run();
+  if (post.media) await env.MEDIA.delete((JSON.parse(post.media) as Media[]).map((m) => m.key));
+  await broadcast({ t: "delete", id: String(id) });
+  if (post.repost_of) await pushStats(post.repost_of);
+}
+
+export async function toggleLike(postId: string) {
+  const userId = await writer();
+  const id = String(postId);
+  const del = await env.DB.prepare("DELETE FROM likes WHERE user_id = ? AND post_id = ?").bind(userId, id).run();
+  if (!del.meta.changes) {
+    await env.DB.prepare("INSERT INTO likes (user_id, post_id, created_at) SELECT ?, id, ? FROM posts WHERE id = ? AND repost_of IS NULL")
+      .bind(userId, Date.now(), id).run();
+  }
+  await pushStats(id);
+  return { liked: !del.meta.changes };
+}
+
+export async function toggleRepost(postId: string) {
+  const userId = await writer();
+  const id = String(postId);
+  const removed = await env.DB.prepare("DELETE FROM posts WHERE author_id = ? AND repost_of = ? RETURNING id").bind(userId, id).first<{ id: string }>();
+  if (removed) {
+    await broadcast({ t: "delete", id: removed.id });
+  } else {
+    await syncUser(userId);
+    const entryId = crypto.randomUUID();
+    const ins = await env.DB.prepare(
+      "INSERT INTO posts (id, author_id, repost_of, created_at) SELECT ?, ?, id, ? FROM posts WHERE id = ? AND repost_of IS NULL AND author_id <> ?",
+    ).bind(entryId, userId, Date.now(), id, userId).run();
+    if (ins.meta.changes) await broadcast({ t: "post", id: entryId, authorId: userId });
+  }
+  await pushStats(id);
+  return { reposted: !removed };
+}
+
+export type Comment = { id: string; body: string; createdAt: number; author: { id: string; name: string; imageUrl: string | null } };
+
+export async function loadComments(postId: string): Promise<Comment[]> {
+  await viewer();
+  const { results } = await env.DB.prepare(
+    `SELECT c.id, c.body, c.created_at, u.id AS uid, u.name, u.image_url FROM comments c JOIN users u ON u.id = c.author_id
+     WHERE c.post_id = ? ORDER BY c.created_at LIMIT 200`,
+  ).bind(String(postId)).all<{ id: string; body: string; created_at: number; uid: string; name: string; image_url: string | null }>();
+  return results.map((r) => ({ id: r.id, body: r.body, createdAt: r.created_at, author: { id: r.uid, name: r.name, imageUrl: r.image_url } }));
+}
+
+export async function addComment(postId: string, input: string) {
+  return comment(postId, input).then((comments) => ({ comments }), failed);
+}
+
+async function comment(postId: string, input: string) {
+  const userId = await writer();
+  const body = text(input, MAX_COMMENT_CHARS);
+  if (!body) throw new Fail("Comment is empty");
+  await syncUser(userId);
+  const ins = await env.DB.prepare("INSERT INTO comments (id, post_id, author_id, body, created_at) SELECT ?, id, ?, ?, ? FROM posts WHERE id = ? AND repost_of IS NULL")
+    .bind(crypto.randomUUID(), userId, body, Date.now(), String(postId)).run();
+  if (!ins.meta.changes) throw new Fail("This post was deleted");
+  await pushStats(String(postId));
+  return loadComments(postId);
+}
+
+export async function toggleFollow(targetId: string) {
+  const userId = await writer();
+  const id = String(targetId);
+  if (id === userId) throw new Error("You can't follow yourself");
+  const del = await env.DB.prepare("DELETE FROM follows WHERE follower_id = ? AND followee_id = ?").bind(userId, id).run();
+  if (!del.meta.changes) {
+    await env.DB.prepare("INSERT INTO follows (follower_id, followee_id, created_at) SELECT ?, id, ? FROM users WHERE id = ?")
+      .bind(userId, Date.now(), id).run();
+  }
+  return { following: !del.meta.changes };
+}

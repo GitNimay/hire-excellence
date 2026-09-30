@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+/* Dark theme, matched to the auth reference; Geist + Vercel-style sizing */
+:root {
+  --background: #161616;
+  --foreground: #ededed;
+  --muted: #a1a1a1;
+  --surface: #1c1c1c;
+  --surface-hover: #242424;
+  --border: #2e2e2e;
+  --ring: #3b82f6;
+  --link: #52a8ff;
+  --danger: #ff6166;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --color-link: var(--link);
+  --color-danger: var(--danger);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+button:not(:disabled),
+[role="button"] {
+  cursor: pointer;
+}

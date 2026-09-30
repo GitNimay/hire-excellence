@@ -1,0 +1,256 @@
+"use client";
+
+import { useSignIn, useSignUp } from "@clerk/nextjs";
+import type { OAuthStrategy, SetActiveNavigate } from "@clerk/nextjs/types";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useState, type FormEvent, type ReactNode } from "react";
+
+type Result = Promise<{ error: unknown }>;
+
+function errorText(e: unknown) {
+  const err = e as { errors?: { longMessage?: string; message?: string }[]; longMessage?: string; message?: string };
+  return err.errors?.[0]?.longMessage ?? err.errors?.[0]?.message ?? err.longMessage ?? err.message ?? "Something went wrong";
+}
+
+function useNavigateToApp(): SetActiveNavigate {
+  const router = useRouter();
+  return ({ decorateUrl }) => {
+    const url = decorateUrl("/dashboard");
+    if (url.startsWith("http")) window.location.href = url;
+    else router.push(url);
+  };
+}
+
+/* ---------- Shared UI ---------- */
+
+const btn =
+  "flex h-10 w-full items-center justify-center gap-2 rounded-md text-sm font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60";
+const btnSecondary = `${btn} relative border border-border bg-surface text-foreground hover:bg-surface-hover`;
+const btnPrimary = `${btn} bg-foreground text-background hover:bg-white`;
+const input =
+  "h-10 w-full rounded-md border border-border bg-surface px-3 text-sm text-foreground placeholder:text-muted outline-none transition-shadow focus:border-ring focus:ring-1 focus:ring-ring";
+
+export function Logo({ size = 48 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48" aria-hidden className="text-[#3a3a3a]">
+      <path fill="currentColor" d="M18 4l10 5.8v11.5L18 27 8 21.3V9.8zM34 14l10 5.8v11.5L34 37l-10-5.7V19.8zM18 24l10 5.8v11.5L18 47 8 41.3V29.8z" />
+    </svg>
+  );
+}
+
+function Shell({ title, subtitle, children, footer }: { title: string; subtitle: ReactNode; children: ReactNode; footer: ReactNode }) {
+  return (
+    <main className="flex min-h-screen flex-1 items-center justify-center px-4 py-12">
+      <div className="w-full max-w-[360px]">
+        <div className="mb-8 flex flex-col items-center text-center">
+          <Logo />
+          <h1 className="mt-6 text-2xl font-semibold tracking-tight">{title}</h1>
+          <p className="mt-1.5 text-sm text-muted">{subtitle}</p>
+        </div>
+        {children}
+        <p className="mt-8 text-center text-sm text-muted">{footer}</p>
+      </div>
+    </main>
+  );
+}
+
+const icons: Record<string, ReactNode> = {
+  oauth_github: (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden>
+      <path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.2-3.1-.1-.4-.5-1.6.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.1 4.7 18 5 18 5c.7 1.6.3 2.8.1 3.2.8.8 1.2 1.9 1.2 3.1 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3" />
+    </svg>
+  ),
+  oauth_google: (
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden>
+      <path fill="#4285F4" d="M22.6 12.3c0-.8-.1-1.6-.2-2.3H12v4.4h5.9a5 5 0 0 1-2.2 3.3v2.7h3.6c2.1-1.9 3.3-4.8 3.3-8.1" />
+      <path fill="#34A853" d="M12 23c3 0 5.5-1 7.3-2.7l-3.6-2.7c-1 .7-2.2 1-3.7 1-2.9 0-5.3-1.9-6.2-4.5H2.1v2.8A11 11 0 0 0 12 23" />
+      <path fill="#FBBC05" d="M5.8 14.1a6.6 6.6 0 0 1 0-4.2V7.1H2.1a11 11 0 0 0 0 9.8z" />
+      <path fill="#EA4335" d="M12 5.4c1.6 0 3.1.6 4.2 1.6l3.2-3.2A11 11 0 0 0 2.1 7.1l3.7 2.8C6.7 7.3 9.1 5.4 12 5.4" />
+    </svg>
+  ),
+  oauth_x: (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden>
+      <path d="M18.9 1.2h3.7l-8 9.2L24 22.8h-7.4l-5.8-7.6-6.6 7.6H.5L9 13 0 1.2h7.6l5.2 6.9zm-1.3 19.4h2L6.5 3.2H4.3z" />
+    </svg>
+  ),
+};
+
+const providers: { strategy: OAuthStrategy; label: string }[] = [
+  { strategy: "oauth_github", label: "GitHub" },
+  { strategy: "oauth_google", label: "Google" },
+  { strategy: "oauth_x", label: "X" },
+];
+
+/** Social buttons + divider + email/OTP form, shared by sign-in and sign-up. */
+function AuthBody({
+  cta,
+  busy,
+  sso,
+  sendCode,
+  verifyCode,
+}: {
+  cta: string;
+  busy: boolean;
+  sso: (strategy: OAuthStrategy) => Result;
+  sendCode: (email: string) => Result;
+  verifyCode: (code: string) => Promise<void | { error: unknown }>;
+}) {
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [step, setStep] = useState<"email" | "code">("email");
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState<string | null>(null);
+
+  const run = async (key: string, fn: () => Promise<void | { error: unknown }>) => {
+    setError("");
+    setPending(key);
+    const res = await fn();
+    setPending(null);
+    if (res?.error) {
+      setError(errorText(res.error));
+      return false;
+    }
+    return true;
+  };
+
+  const onEmail = async (e: FormEvent) => {
+    e.preventDefault();
+    if (await run("email", () => sendCode(email.trim()))) setStep("code");
+  };
+  const onCode = (e: FormEvent) => {
+    e.preventDefault();
+    run("code", () => verifyCode(code));
+  };
+  const disabled = busy || pending !== null;
+
+  if (step === "code") {
+    return (
+      <form onSubmit={onCode} className="space-y-3">
+        <p className="text-center text-sm text-muted">
+          We sent a 6-digit code to <span className="text-foreground">{email}</span>
+        </p>
+        <input
+          className={`${input} text-center font-mono tracking-[0.5em]`}
+          value={code}
+          onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          maxLength={6}
+          placeholder="000000"
+          aria-label="Verification code"
+          autoFocus
+          required
+        />
+        {error && <p role="alert" className="text-sm text-danger">{error}</p>}
+        <button type="submit" className={btnPrimary} disabled={disabled || code.length !== 6}>
+          {pending === "code" ? "Verifying…" : "Verify"}
+        </button>
+        <div className="flex justify-between text-sm">
+          <button type="button" className="text-muted hover:text-foreground" onClick={() => { setStep("email"); setCode(""); setError(""); }}>
+            Use a different email
+          </button>
+          <button type="button" className="text-link hover:underline disabled:opacity-60" disabled={disabled} onClick={() => run("resend", () => sendCode(email.trim()))}>
+            {pending === "resend" ? "Sending…" : "Resend code"}
+          </button>
+        </div>
+      </form>
+    );
+  }
+
+  return (
+    <>
+      <div className="space-y-3">
+        {providers.map(({ strategy, label }) => (
+          <button key={strategy} type="button" className={btnSecondary} disabled={disabled} onClick={() => run(strategy, () => sso(strategy))}>
+            <span className="absolute left-4">{icons[strategy]}</span>
+            {pending === strategy ? "Redirecting…" : `Continue with ${label}`}
+          </button>
+        ))}
+      </div>
+
+      <div className="my-6 flex items-center gap-3 text-xs uppercase text-muted">
+        <span className="h-px flex-1 bg-border" />
+        or
+        <span className="h-px flex-1 bg-border" />
+      </div>
+
+      <form onSubmit={onEmail} className="space-y-3">
+        <input
+          className={input}
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="Email address"
+          aria-label="Email address"
+          autoComplete="email"
+          autoFocus
+          required
+        />
+        {error && <p role="alert" className="text-sm text-danger">{error}</p>}
+        <button type="submit" className={btnPrimary} disabled={disabled}>
+          {pending === "email" ? "Sending code…" : cta}
+        </button>
+      </form>
+    </>
+  );
+}
+
+/* ---------- Flows ---------- */
+
+export function SignInForm() {
+  const { signIn, fetchStatus } = useSignIn();
+  const navigate = useNavigateToApp();
+
+  return (
+    <Shell
+      title="Welcome back"
+      subtitle="Log in to your account"
+      footer={<>Don&apos;t have an account? <Link href="/sign-up" className="text-link hover:underline">Sign up</Link></>}
+    >
+      <AuthBody
+        cta="Log in"
+        busy={fetchStatus === "fetching"}
+        sso={(strategy) => signIn.sso({ strategy, redirectUrl: "/dashboard", redirectCallbackUrl: "/sso-callback" })}
+        sendCode={(emailAddress) => signIn.emailCode.sendCode({ emailAddress })}
+        verifyCode={async (code) => {
+          const res = await signIn.emailCode.verifyCode({ code });
+          if (res.error) return res;
+          if (signIn.status === "complete") return signIn.finalize({ navigate });
+          return { error: new Error(`Additional step required (${signIn.status}).`) };
+        }}
+      />
+    </Shell>
+  );
+}
+
+export function SignUpForm() {
+  const { signUp, fetchStatus } = useSignUp();
+  const navigate = useNavigateToApp();
+
+  return (
+    <Shell
+      title="Create your account"
+      subtitle="Join Hire Excellence to connect and grow"
+      footer={<>Already have an account? <Link href="/sign-in" className="text-link hover:underline">Log in</Link></>}
+    >
+      <AuthBody
+        cta="Sign up"
+        busy={fetchStatus === "fetching"}
+        sso={(strategy) => signUp.sso({ strategy, redirectUrl: "/dashboard", redirectCallbackUrl: "/sso-callback" })}
+        sendCode={async (emailAddress) => {
+          const res = await signUp.create({ emailAddress });
+          return res.error ? res : signUp.verifications.sendEmailCode();
+        }}
+        verifyCode={async (code) => {
+          const res = await signUp.verifications.verifyEmailCode({ code });
+          if (res.error) return res;
+          if (signUp.status === "complete") return signUp.finalize({ navigate });
+          return { error: new Error(`Missing: ${signUp.missingFields.join(", ") || signUp.status}`) };
+        }}
+      />
+      {/* Clerk bot protection renders its CAPTCHA here */}
+      <div id="clerk-captcha" className="mt-3" />
+    </Shell>
+  );
+}

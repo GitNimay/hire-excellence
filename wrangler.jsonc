@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hire-excellence",
+  // Wraps vinext's handler: adds the realtime WebSocket route and exports the FeedHub Durable Object
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-09-26",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "not_found_handling": "none", "binding": "ASSETS" },
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hire-excellence-db",
+      "database_id": "80ba1497-4549-4f52-9171-ba69fb4ca2bc",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "hire-excellence-media" }],
+  "durable_objects": { "bindings": [{ "name": "FEED_HUB", "class_name": "FeedHub" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FeedHub"] }],
+  // Per-user write throttle (posts, uploads, likes, comments...)
+  "ratelimits": [{ "name": "WRITE_LIMIT", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } }]
+  // Secrets (not in this file): CLERK_SECRET_KEY via `wrangler secret put`, .env.local locally
+}
